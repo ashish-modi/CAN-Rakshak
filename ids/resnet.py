@@ -1,4 +1,3 @@
-from evaluate import evaluation_metrics
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,18 +6,11 @@ from torchvision import datasets, transforms, models
 import numpy as np
 import os
 from PIL import Image
-import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix, accuracy_score
-from config import *
 import sys
+
 from ids.base import IDS
-from config import *
-from datetime import datetime 
-
-
-class ResNet(IDS):
+class Resnet(IDS):
     def __init__(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = InceptionResNetV1(num_classes=2).to(self.device)
@@ -26,36 +18,37 @@ class ResNet(IDS):
         self.criterion = nn.CrossEntropyLoss()
  
 
-    def train(self, X_train=None, Y_train=None, **kwargs):
-
+    def train(self, train_dataset_dir, X_train=None, Y_train=None, cfg=None, **kwargs):
+        cfg = cfg or {}
         # Load the test and train datasets from multiple folders
-        dataset_path = os.path.join(DIR_PATH, "..", "datasets", DATASET_NAME)
-        train_dataset_dir = os.path.join(dataset_path, "train", TRAIN_DATASET_DIR)
         train_label_file = os.path.join(train_dataset_dir, "labels.txt")
         train_loader = self.load_dataset(train_dataset_dir, train_label_file, is_train=True)
         print("Loaded train dataset")
-    
-        epochs = EPOCHS   # default
+
+        epochs = cfg.get('epochs', 10)
+
         # Train the model
         model = self.train_wisa(self.model, self.device, train_loader, self.optimizer, self.criterion, epochs)
 
         self.model = model    
  
-    def test(self, X_test=None, Y_test=None, **kwargs):
+    def test(self, X_test=None, Y_test=None, cfg=None, **kwargs):
+        cfg = cfg or {}
         print("Entered model's testing method")
-        dataset_path = os.path.join(DIR_PATH, "..", "datasets", DATASET_NAME)
-        test_dataset_dir = os.path.join(dataset_path, "test", TEST_DATASET_DIR)
-        
+
+        dataset_path = os.path.join(cfg.get('dir_path', ''), "..", "datasets", cfg.get('dataset_name', ''))
+        test_dataset_dir = os.path.join(dataset_path, "test", cfg.get('test_dataset_dir', ''))
         test_label_file = os.path.join(test_dataset_dir, "labels.txt")
-        
         test_loader = self.load_dataset(test_dataset_dir, test_label_file,is_train=False)
         print("Loaded test dataset")
 
         all_preds, all_labels = self.test_wisa(self.model, self.device, test_loader, self.criterion)
+        return all_preds, all_labels
 
-        evaluation_metrics(all_preds, all_labels)
+    
 
     def save(self, path):
+        self.model.eval()
         scripted_model = torch.jit.script(self.model)
         scripted_model.save(path)
         print("Model saved.")
@@ -63,52 +56,10 @@ class ResNet(IDS):
 
     def predict(self, X_test):
         super().predict(X_test)
-
-
     def load(self, path):
         self.model = torch.jit.load(path)
         self.model.to(self.device)
 
-    
-    def evaluation_metrics(self, all_preds, all_labels):
- 
-        # Generate confusion matrix
-        cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
-    
-        # Display confusion matrix
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0, 1])
-        disp.plot(cmap=plt.cm.Blues)
-        dataset_path = os.path.join(DIR_PATH, "..", "datasets", DATASET_NAME)
-        result_path = os.path.join(dataset_path, "Results", MODEL_NAME)
-        timestamp = datetime.now().strftime("_%Y_%m_%d_%H%M%S")
-
-        image = os.path.join(result_path, f'target{timestamp}.png')
-        os.makedirs(result_path, exist_ok=True)
-
-        plt.title('Confusion Matrix')
-        plt.savefig(image, dpi=300)
-    
-        # Now you can access the true negatives and other metrics
-        true_negatives = cm[0, 0]
-        false_positives = cm[0, 1]
-        false_negatives = cm[1, 0]
-        true_positives = cm[1, 1]
-
-        tnr = true_negatives / (true_negatives + false_positives)  # True Negative Rate
-        mdr = true_positives / (true_positives + false_negatives)  # malicious Detection Rate
-    
-        IDS_accu = accuracy_score(all_labels, all_preds)
-        IDS_prec = precision_score(all_labels, all_preds)
-        IDS_recall = recall_score (all_labels,all_preds)
-        IDS_F1 = f1_score(all_labels,all_preds)
-
-        misclassified_attack_packets = ((all_labels == 1) & (all_preds == 0)).sum().item()
-    
-        total_attack_packets = (all_labels == 1).sum().item()
-    
-        oa_asr = misclassified_attack_packets / total_attack_packets
-    
-        return tnr, mdr, oa_asr, IDS_accu, IDS_prec, IDS_recall, IDS_F1
     
     def load_labels(self, label_file):
         """Load image labels from the label file."""
@@ -122,7 +73,7 @@ class ResNet(IDS):
     def load_dataset(self, data_dir, label_file, is_train):
         """Load datasets and create DataLoader."""
         image_labels = self.load_labels(label_file)
-        
+        print("Length Image labels : ", len(image_labels))
         images = []
         labels = []
     
@@ -173,13 +124,12 @@ class ResNet(IDS):
                         f"Loss: {loss.item():.6f} Accuracy: {accuracy:.2f}%")
     
         print("Training complete!")
-        
-    
-        # Print overall training loss and accuracy for the epoch
-        overall_accuracy = 100. * correct / len(train_loader.dataset)
+
         return model
     
     def test_wisa(self, model, device, test_loader, criterion):
+    
+        # model.load_state_dict(torch.load(model_path,map_location=torch.device('cpu'), weights_only='True'))
         model.eval()
         test_loss = 0
         correct = 0

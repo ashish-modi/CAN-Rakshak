@@ -9,7 +9,7 @@ import torch
 from torchvision import models
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.utils.data import DataLoader, TensorDataset, Subset, Dataset
 from torchvision import datasets, transforms, models
 import numpy as np
 from PIL import Image
@@ -84,24 +84,35 @@ class Densenet161(IDS):
     def load_dataset(self, data_dir, label_file, is_train):
         """Load datasets and create DataLoader."""
         image_labels = self.load_labels(label_file)
-        images = []
-        labels = []
-        
-        for filename, label in image_labels.items():
-            img_path = os.path.join(data_dir, filename)
-            if os.path.exists(img_path):
+        transform = data_transforms['train' if is_train else 'test']
+
+        class ImageLabelDataset(Dataset):
+            def __init__(self, data_dir, image_labels, transform):
+                self.samples = [
+                    (os.path.join(data_dir, filename), label)
+                    for filename, label in image_labels.items()
+                    if os.path.exists(os.path.join(data_dir, filename))
+                ]
+                self.transform = transform
+
+            def __len__(self):
+                return len(self.samples)
+
+            def __getitem__(self, idx):
+                img_path, label = self.samples[idx]
                 image = Image.open(img_path).convert("RGB")
-                image = data_transforms['train' if is_train else 'test'](image)
-                images.append(image)
-                labels.append(label)
-    
-        images_tensor = torch.stack(images)
-        labels_tensor = torch.tensor(labels)
-        dataset = TensorDataset(images_tensor, labels_tensor)
+                image = self.transform(image)
+                return image, label
+
+        dataset = ImageLabelDataset(data_dir, image_labels, transform)
         batch_size = 32 if is_train else 1
-        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=is_train, num_workers=4)
-    
-        print(f'Loaded {len(images)} images.')
+        num_workers = 4 if is_train else 2
+        data_loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=is_train,
+            num_workers=num_workers, pin_memory=True, persistent_workers=True,
+        )
+
+        print(f'Loaded {len(dataset)} images.')
         return data_loader
     
     

@@ -8,6 +8,14 @@ from common_imports import (
 )
 from ids.base import IDS
 
+import inspect
+
+_LOAD_MODEL_KWARGS = (
+    {'safe_mode': False}
+    if 'safe_mode' in inspect.signature(tf.keras.models.load_model).parameters
+    else {}
+)
+
 class FrameInceptionResNet(IDS):
     def __init__(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -97,7 +105,7 @@ class FrameInceptionResNet(IDS):
         super().predict(X_test)
 
     def load(self, path):
-        self.model.model = tf.keras.models.load_model(path, compile=False)
+        self.model.model = tf.keras.models.load_model(path, compile=False, **_LOAD_MODEL_KWARGS)
         self.model.model.compile(
             # optimizer='adam',
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
@@ -210,14 +218,7 @@ class FrameInceptionResNet(IDS):
 
         return frames, labels
 class BatchLossHistory(Callback):
-    """
-    Custom Keras callback to record training loss at every batch iteration.
-    
-    This provides more granular monitoring than epoch-level tracking, allowing
-    for detailed analysis of training dynamics and convergence behavior.
-    Particularly useful for genetic algorithm experiments that need to track
-    training progress over iterations rather than epochs.
-    """
+   
     
     def on_train_begin(self, logs=None):
         """
@@ -241,9 +242,7 @@ class BatchLossHistory(Callback):
         # Store iteration number and corresponding loss value
         self.batch_losses.append((self.iterations, logs.get('loss')))
 
-###################################################
-# Stem Block: Initial Feature Extraction
-###################################################
+
 def stem_block(inputs):
     """
     Stem block for initial feature extraction from 29x29 CAN frame inputs.
@@ -283,9 +282,6 @@ def stem_block(inputs):
     
     return x
 
-###################################################
-# Inception-ResNet Block A: Multi-Scale Feature Extraction
-###################################################
 def inception_resnet_a_block(x, scale=0.1):
     """
     Inception-ResNet-A block combining multi-scale convolutions with residual connections.
@@ -347,9 +343,6 @@ def inception_resnet_a_block(x, scale=0.1):
     
     return x
 
-###################################################
-# Reduction Block A: Spatial Downsampling with Feature Expansion
-###################################################
 def reduction_a_block(x):
     """
     Reduction-A block for spatial downsampling while expanding channel depth.
@@ -393,9 +386,6 @@ def reduction_a_block(x):
     
     return x
 
-###################################################
-# Inception-ResNet Block B: High-Level Feature Processing
-###################################################
 def inception_resnet_b_block(x, scale=0.1):
     """
     Inception-ResNet-B block for high-level feature extraction with asymmetric convolutions.
@@ -446,9 +436,6 @@ def inception_resnet_b_block(x, scale=0.1):
     
     return x
 
-###################################################
-# Reduction Block B: Final Spatial Downsampling
-###################################################
 def reduction_b_block(x):
     """
     Reduction-B block for final spatial downsampling before global pooling.
@@ -482,9 +469,6 @@ def reduction_b_block(x):
     
     return x
 
-###################################################
-# Main Model Architecture Builder
-###################################################
 def build_reduced_inception_resnet(input_shape=(29, 29, 1), num_classes=2, dropout_rate=0.2):
     """
     Build the complete reduced Inception-ResNet model for CAN intrusion detection.
@@ -552,9 +536,6 @@ def build_reduced_inception_resnet(input_shape=(29, 29, 1), num_classes=2, dropo
     model = Model(inputs, outputs)
     return model
 
-###################################################
-# Model Wrapper Class for Training and Evaluation
-###################################################
 class Inception_Resnet_V1:
     """
     Wrapper class for the reduced Inception-ResNet model providing training and evaluation utilities.
@@ -627,7 +608,7 @@ class Inception_Resnet_V1:
         
         # Initialize custom callback for batch-level loss tracking
         batch_callback = BatchLossHistory()
-        
+
         # Train the model with batch-level monitoring
         history = self.model.fit(
             x_train, y_train,
@@ -652,20 +633,3 @@ class Inception_Resnet_V1:
         """
         return self.model.summary()
 
-###################################################
-# Development and Testing Code
-###################################################
-# Uncomment the following lines for model architecture debugging and testing:
-# if __name__ == "__main__":
-#     # Create model instance with sample hyperparameters
-#     instance = Inception_Resnet_V1(epochs=5, batch_size=32)
-#     
-#     # Display model architecture summary
-#     instance.summary()
-#     
-#     # Optional: Test with dummy data
-#     # import numpy as np
-#     # x_dummy = np.random.rand(100, 29, 29, 1)
-#     # y_dummy = np.random.randint(0, 2, 100)
-#     # history, batch_losses = instance.train(x_dummy, y_dummy, x_dummy, y_dummy)
-#     # print(f"Training completed. Final batch loss: {batch_losses[-1][1]:.4f}")
