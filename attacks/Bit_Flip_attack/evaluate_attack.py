@@ -195,9 +195,9 @@ def save_preds(pass_num, tracksheet, traffic_rows, output_path, preds, trackshee
 # ---------------------------------------------------------
 # Confusion Matrix Plot
 # ---------------------------------------------------------
-def plot_confusion(cm, pass_num,y_test,preds):
+def plot_confusion(cm, pass_num, y_test, preds, attack_mode="dos", results_dir="."):
     plt.imshow(cm, cmap='Blues')
-    plt.title("Confusion Matrix - DOS")
+    plt.title(f"Confusion Matrix - {attack_mode.upper()}")
     plt.colorbar()
     ticks = ["Benign", "Attack"]
     plt.xticks(range(2), ticks)
@@ -210,10 +210,11 @@ def plot_confusion(cm, pass_num,y_test,preds):
     plt.ylabel("True")
     plt.xlabel("Predicted")
     plt.tight_layout()
-    os.makedirs("./CF_target", exist_ok=True)
-    # plt.savefig("./CF_target/DoS_confusion_matrix_pass_{}.png".format(pass_num))
-    plt.savefig("./CF_target/dos_confusion_matrix_pass_{}.png".format(pass_num))
-    print("Saved confusion matrix plot → ./CF_target/dos_confusion_matrix_pass_{}.png".format(pass_num))
+    cf_dir = os.path.join(results_dir, "CF_target")
+    os.makedirs(cf_dir, exist_ok=True)
+    cf_path = os.path.join(cf_dir, f"{attack_mode}_confusion_matrix_pass_{pass_num}.png")
+    plt.savefig(cf_path)
+    print(f"Saved confusion matrix plot → {cf_path}")
 
     # plt.show()
     plt.close()
@@ -264,6 +265,8 @@ def run(params):
     tracksheet = params["tracksheet"]
     output_path = params["output_path"]
     tracksheet_dir = params.get("tracksheet_dir", "tracksheets_CH")
+    attack_mode = params.get("attack_mode", "dos")
+    results_dir = os.path.dirname(output_path)
     
     '''
     # MODEL Training 
@@ -289,7 +292,7 @@ def run(params):
 
 
     ##TEST
-    model = tf.keras.models.load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
     # model.eval()
     print("\n--- Loading Test Data ---")
     X_test, y_test,traffic_rows = build_frames(traffic_path)
@@ -302,18 +305,19 @@ def run(params):
     print("-----------------------------------\n")
 
     print("\n--- Evaluating Model ---")
+    print(f"Model path: {model_path}")
     # preds = np.argmax(irn.model.predict(X_test), axis=1)
     preds = np.argmax(model.predict(X_test), axis=1)
 
     cm = confusion_matrix(y_test, preds)
     # print("\nConfusion Matrix:\n", cm)
 
-    plot_confusion(cm,rounds,y_test,preds)
+    plot_confusion(cm, rounds, y_test, preds, attack_mode, results_dir)
 
     # print("\nClassification Report:")
     # print(classification_report(y_test, preds, target_names=["Benign", "Attack"]))
 
-    print("\nSaved confusion matrix: dos_confusion_matrix.png\n")
+    print(f"\nSaved confusion matrix: {attack_mode}_confusion_matrix_pass_{rounds}.png\n")
 
     # save_preds(traffic_rows,output_path,preds)
     save_preds(rounds, tracksheet, traffic_rows, output_path, preds, tracksheet_dir)

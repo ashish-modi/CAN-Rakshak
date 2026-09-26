@@ -108,12 +108,12 @@ def save_to_txt(dataset, traffic_file, packet_level_data,rounds):
             # print(org_label)
             oop_label = extra_data[col_index["operation_label"]]   # raw attack label (I/M/None)
             # print(oop_label)
-            if rounds == 0:
-                final_label = convert_label(org_label, oop_label)
-            else:
-                pred_label = extra_data[col_index["pred_label"]] 
+            # if rounds == 0:
+            # final_label = convert_label(org_label, oop_label)
+            # else:
+            # pred_label = extra_data[col_index["pred_label"]] 
                 # print(pred_label)
-                final_label = convert_label(pred_label, oop_label)
+            final_label = convert_label(org_label, oop_label)
             
             data_bytes_str = ",".join(data["data"])
 
