@@ -49,6 +49,12 @@ class AdversarialSpoofAttack(GeneticAttack):
         self.original_dummy_rows = []
         self.ecu_control = self.data['ecu_control']  # ECU control values for each frame
 
+        # ADDED: frame geometry read from the data instead of hardcoded, so the
+        # same class handles the 29x29 CANShield frames and the 32x11 MULSAM
+        # windows. AdversarialDosAttack already derives num_cols this way.
+        self.num_rows = self.x_test.shape[1]   # packets per frame  (29 | 32)
+        self.num_cols = self.x_test.shape[2]   # ID bits per packet (29 | 11)
+
     def find_dummy_rows(self, frame_idx):
         """
         Find and return indices of ECU-controlled dummy rows for a specific frame.
@@ -69,8 +75,14 @@ class AdversarialSpoofAttack(GeneticAttack):
         """
         if frame_idx >= len(self.ecu_control):
             return []  # Return empty list if index is out of bounds
-            
-        return [j for j in range(29) if self.ecu_control[frame_idx][j] == 1]
+
+        # ── ORIGINAL ─────────────────────────────────────────────────────────
+        # return [j for j in range(29) if self.ecu_control[frame_idx][j] == 1]
+        # ─────────────────────────────────────────────────────────────────────
+        # CHANGED: 29 was the CANShield frame height. A MULSAM window is 32
+        # packets, so the hardcoded bound silently ignored rows 29-31 — the
+        # attacker would never touch the last three messages of any frame.
+        return [j for j in range(self.num_rows) if self.ecu_control[frame_idx][j] == 1]
 
     def mutate(self, frame):
         """
@@ -92,12 +104,18 @@ class AdversarialSpoofAttack(GeneticAttack):
             Mutated copy of the input frame
         """
         mutated = frame.copy()
-        
+
         for i in self.original_dummy_rows:
             if random.random() < self.mutation_rate:
-                bit_to_flip = random.randint(0, 28)
+                # ── ORIGINAL ─────────────────────────────────────────────────
+                # bit_to_flip = random.randint(0, 28)
+                # ─────────────────────────────────────────────────────────────
+                # CHANGED: 28 was the last column of a 29-bit CANShield row. An
+                # 11-bit MULSAM row only has columns 0-10, so this raised
+                # IndexError on the first mutation. Derived from the data now.
+                bit_to_flip = random.randint(0, self.num_cols - 1)
                 mutated[i, bit_to_flip, 0] = 1
-                
+
         return mutated
 
     def crossover(self, parent1, parent2):
@@ -129,30 +147,131 @@ class AdversarialSpoofAttack(GeneticAttack):
                 
         return child
 
-    def calculate_confidence(self, frame):
+    # ── ORIGINAL ─────────────────────────────────────────────────────────────
+    # def calculate_confidence(self, frame):
+    #     """
+    #     Calculate the IDS confidence score for classifying a frame as an attack.
+    #
+    #     The IDS model outputs probabilities for [normal, attack] classes.
+    #     We return the attack confidence (index 1) since our goal is to
+    #     minimize this score below 0.5 to achieve misclassification.
+    #
+    #     Args:
+    #         frame: 29x29x1 numpy array representing a CAN frame
+    #
+    #     Returns:
+    #         Float between 0-1 representing attack confidence score
+    #     """
+    #     frame_batch = np.expand_dims(frame, 0)
+    #
+    #     prediction = self.model.predict(frame_batch, verbose=0)
+    #
+    #     return prediction[0][1]
+    # ─────────────────────────────────────────────────────────────────────────
+    # CHANGED: removed. This override was a byte-for-byte copy of
+    # GeneticAttack.calculate_confidence except that it called self.model.predict
+    # directly — a Keras-only call that shadowed the framework dispatch added to
+    # the base class, so a .pth target would fail here. The inherited version
+    # does the same thing through predict_proba and works for both frameworks.
+
+    def _next_generation(self, population, scores):
         """
-        Calculate the IDS confidence score for classifying a frame as an attack.
-        
-        The IDS model outputs probabilities for [normal, attack] classes.
-        We return the attack confidence (index 1) since our goal is to
-        minimize this score below 0.5 to achieve misclassification.
-        
+        Build the next population: elitist carry-over plus fitness-proportionate
+        crossover and mutation.
+
+        Fitness is 1 - attack_confidence, so lower-confidence (better evading)
+        individuals are more likely to be selected as parents. If every
+        individual scores 1.0 there is nothing to discriminate on, so selection
+        falls back to uniform.
+
         Args:
-            frame: 29x29x1 numpy array representing a CAN frame
-            
+            population: Current list of frames
+            scores: Attack confidence per individual, same order as population
+
         Returns:
-            Float between 0-1 representing attack confidence score
+            New population of size self.population_size
         """
-        frame_batch = np.expand_dims(frame, 0)
-        
-        prediction = self.model.predict(frame_batch, verbose=0)
-        
-        return prediction[0][1]
+        inv_scores = 1.0 - scores
+        total      = inv_scores.sum()
+
+        if total <= 1e-12 or np.count_nonzero(inv_scores) < 2:
+            selection_probs = np.ones_like(inv_scores) / len(inv_scores)
+        else:
+            selection_probs = inv_scores / total
+
+        indices = np.arange(len(population))
+        new_pop = [population[int(np.argmin(scores))]]  # elite
+
+        while len(new_pop) < self.population_size:
+            p1_idx, p2_idx = np.random.choice(
+                indices, size=2, p=selection_probs, replace=False
+            )
+            child = self.crossover(population[p1_idx], population[p2_idx])
+            new_pop.append(self.mutate(child))
+
+        return new_pop
+
+    def _evolve(self, frame, dummy_rows):
+        """
+        Run the genetic search on a single frame until evasion or generation cap.
+
+        Shared by generate_adversarial_attack and both parameter experiments so
+        the three call sites cannot drift apart.
+
+        Deliberately silent: callers log one line per frame instead. Printing per
+        generation puts tens of thousands of lines in the log for a normal run.
+
+        Args:
+            frame: 29x29x1 numpy array to perturb
+            dummy_rows: Row indices the mutation/crossover operators may touch
+
+        Returns:
+            tuple: (best_frame, generations_used, best_score, evaded)
+        """
+        self.original_dummy_rows = list(dummy_rows)
+
+        mut_rate = self.mutation_rate
+        self.mutation_rate = 1  # Force mutation so the initial population is diverse
+        population = [self.mutate(frame.copy()) for _ in range(self.population_size)]
+        self.mutation_rate = mut_rate
+
+        for generation in range(self.max_generations):
+            scores = np.nan_to_num(self.calculate_confidence_batch(population), nan=1.0)
+
+            success_idx = np.where(scores < 0.5)[0]
+            if len(success_idx) > 0:
+                winner = int(success_idx[0])
+                return population[winner], generation + 1, float(scores[winner]), True
+
+            population = self._next_generation(population, scores)
+
+        # The loop replaced `population` on its final iteration, so the last
+        # computed `scores` belong to the previous generation — score the
+        # surviving population instead of indexing it with stale fitness.
+        scores   = np.nan_to_num(self.calculate_confidence_batch(population), nan=1.0)
+        best_idx = int(np.argmin(scores))
+
+        return population[best_idx], self.max_generations, float(scores[best_idx]), False
+
+    def _suitable_attack_frames(self, threshold):
+        """
+        Indices of attack frames with at least `threshold` ECU-controlled rows.
+
+        Args:
+            threshold: Minimum number of modifiable rows
+
+        Returns:
+            numpy array of frame indices
+        """
+        n      = min(len(self.x_test), len(self.ecu_control))
+        counts = (self.ecu_control[:n] == 1).sum(axis=1)
+
+        return np.where((self.y_test[:n] == 1) & (counts >= threshold))[0]
 
     def generate_adversarial_attack(self, dummy_row_threshold=1, max_frames=100):
         """
         Main genetic algorithm to generate adversarial Spoofing attacks.
-        
+
         Process:
         1. Create balanced dataset (70% attack, 30% benign)
         2. Add benign frames directly (no modification needed)
@@ -168,11 +287,13 @@ class AdversarialSpoofAttack(GeneticAttack):
             max_frames: Maximum total frames to include in final dataset
             
         Returns:
-            tuple: (final_test, y_test, orig_frame, generations_needed)
+            tuple: (final_test, y_test, orig_frame, generations_needed, frame_indices)
                 - final_test: Adversarial frames ready for evaluation
                 - y_test: Corresponding labels for the frames
                 - orig_frame: Original frames before adversarial modification
                 - generations_needed: List of generations required per attack frame
+                - frame_indices: Source index in self.x_test of each returned frame,
+                  which is what lets the decoder map perturbations back to CAN rows
         """
         attack_count = int(max_frames * 0.7)
         benign_count = max_frames - attack_count
@@ -192,11 +313,14 @@ class AdversarialSpoofAttack(GeneticAttack):
         orig_frame = []          # Original frames for comparison
         final_test = []          # Adversarial/benign frames for evaluation
         generations_needed = []  # Track genetic algorithm performance
-        
+        frame_indices = []       # Source index in x_test of each returned frame
+
         for i in benign_indices:
             final_test.append(self.x_test[i])
             orig_frame.append(self.x_test[i])
-        
+            frame_indices.append(int(i))
+
+
         print("Starting genetic algorithm for adversarial attack generation...")
         
         attack_frames_processed = 0
@@ -205,206 +329,146 @@ class AdversarialSpoofAttack(GeneticAttack):
                 break
                 
             dummy_rows = self.find_dummy_rows(i)
-            
+
             if len(dummy_rows) < dummy_row_threshold:
-                continue  # Skip this frame
-                final_test.append(self.x_test[i])
-                orig_frame.append(self.x_test[i])
-                attack_frames_processed += 1
-            else:
-                self.original_dummy_rows = dummy_rows.copy()
-                frame_copy = self.x_test[i].copy()
-                
-                mut_rate = self.mutation_rate  # Save current mutation rate
-                self.mutation_rate = 1         # Force mutation for population diversity
-                
-                population = [self.mutate(frame_copy.copy()) for _ in range(self.population_size)]
-                
-                self.mutation_rate = mut_rate
-                
-                success_generation = -1  # Track when successful attack was found
-                
-                for generation in range(self.max_generations):
-                    print(f"Attack frame {attack_frames_processed+1}/{attack_count}, Generation {generation+1}/{self.max_generations}")
+                continue  # Not enough modifiable rows — skip this frame entirely
 
-                    # Batch predict all individuals at once
-                    scores = self.calculate_confidence_batch(population)
-                    scores = np.nan_to_num(scores, nan=1.0)
+            best, generations, best_score, evaded = self._evolve(self.x_test[i], dummy_rows)
 
-                    # Check for successful evasion
-                    success_idx = np.where(scores < 0.5)[0]
-                    if len(success_idx) > 0:
-                        winner = success_idx[0]
-                        print(f"Successful attack found in generation {generation+1}")
-                        final_test.append(population[winner])
-                        orig_frame.append(self.x_test[i])
-                        success_generation = generation + 1
-                        break
+            # One line per frame — flushed so `tail -f` tracks a redirected run.
+            outcome = (f"evaded in generation {generations}" if evaded
+                       else f"NOT evaded in {generations} generations, best score {best_score:.4f}")
+            print(f"Attack frame {attack_frames_processed+1}/{attack_count} "
+                  f"(frame {i}): {outcome}", flush=True)
 
-                    inv_scores = 1.0 - scores
+            final_test.append(best)
+            orig_frame.append(self.x_test[i])
+            generations_needed.append(generations)
+            frame_indices.append(int(i))
+            attack_frames_processed += 1
 
-                    total = inv_scores.sum()
-                    num_positive = np.count_nonzero(inv_scores)
-
-                    if total <= 1e-12 or num_positive < 2:
-                        selection_probs = np.ones_like(inv_scores) / len(inv_scores)
-                    else:
-                        selection_probs = inv_scores / total
-
-                    indices = np.arange(len(population))
-                    new_pop = []
-
-                    best_idx = np.argmin(scores)
-                    new_pop.append(population[best_idx])
-
-                    while len(new_pop) < self.population_size:
-                        p1_idx, p2_idx = np.random.choice(
-                            indices, size=2, p=selection_probs, replace=False
-                        )
-
-                        child = self.crossover(
-                            population[p1_idx],
-                            population[p2_idx]
-                        )
-
-                        child = self.mutate(child)
-                        new_pop.append(child)
-
-                    population = new_pop
-
-                if success_generation == -1:
-                    best_idx = np.argmin(scores)
-                    print(f"Best score achieved: {scores[best_idx]:.4f}")
-                    final_test.append(population[best_idx])
-                    orig_frame.append(self.x_test[i])
-                    success_generation = self.max_generations
-                
-                generations_needed.append(success_generation)
-                attack_frames_processed += 1
-        
         y_final = np.zeros(len(final_test))
         y_final[benign_count:] = 1  # Attack samples start after benign samples
-        
-        return np.array(final_test), y_final, np.array(orig_frame), generations_needed
 
-    def run_dummy_row_experiment(self,model_path, max_frames=20):
+        return (np.array(final_test), y_final, np.array(orig_frame),
+                generations_needed, np.array(frame_indices))
+
+    def run_dummy_row_experiment(self, max_frames=20, mutation_rate=0.3,
+                                 thresholds=(2, 4, 6, 8, 10, 12, 14, 16, 18, 20)):
         """
-        Experimental function to test the effect of ECU-controlled dummy row threshold on attack success.
-        
-        Tests different minimum ECU-controlled row requirements and measures performance.
-        Higher thresholds mean:
+        Test the effect of the ECU-controlled dummy row threshold on attack success.
+
+        Tests different minimum ECU-controlled row requirements and measures
+        performance. Higher thresholds mean:
         - More ECU-controlled modification space available (easier attacks)
         - Fewer eligible frames (reduced dataset size)
-        
+
+        Runs against this instance's already-loaded model and dataset — building a
+        fresh AdversarialSpoofAttack per threshold would reload the model and the
+        full test npz ten times over.
+
         Args:
-            model_path: Path to the trained IDS model
             max_frames: Number of frames to test per threshold
-            
+            mutation_rate: Fixed mutation rate, held constant for fair comparison
+            thresholds: Dummy row thresholds to sweep
+
         Returns:
             Dictionary mapping dummy row thresholds to average generations needed
         """
-        dummy_row_thresholds = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-        results = {}
-        
-        attack_obj = AdversarialSpoofAttack(model_path=model_path)
-        
-        for threshold in dummy_row_thresholds:
-            print(f"\n--- Testing dummy row threshold: {threshold} ---")
-            
-            suitable_frames = []
-            for i in range(min(len(attack_obj.x_test), len(attack_obj.ecu_control))):
-                if attack_obj.y_test[i] == 1:  # Only consider attack frames
-                    dummy_rows = attack_obj.find_dummy_rows(i)
-                    if len(dummy_rows) >= threshold:  # Frame has enough ECU-controlled rows
-                        suitable_frames.append(i)
-            
-            print(f"Found {len(suitable_frames)} frames with dummy rows >= {threshold}")
-            
-            if len(suitable_frames) == 0:
-                results[threshold] = 0
-                print(f"Dummy row threshold {threshold}: No suitable frames found")
-                continue
-                
-            suitable_frames = suitable_frames[:max_frames]
-            
-            attack = AdversarialSpoofAttack(
-                model_path=model_path,
-                population_size=100,
-                max_generations=75,
-                mutation_rate=0.3  # Fixed mutation rate for fair comparison
-            )
-            
-            generations_list = []
-            for idx, frame_idx in enumerate(suitable_frames):
-                print(f"Processing frame {idx+1}/{len(suitable_frames)}")
-                
-                frame = attack.x_test[frame_idx].copy()
-                dummy_rows = attack.find_dummy_rows(frame_idx)
-                attack.original_dummy_rows = dummy_rows.copy()
-                
-                population = [attack.mutate(frame.copy()) for _ in range(attack.population_size)]
-                
-                success_generation = -1
-                for generation in range(attack.max_generations):
-                    # Batch predict all individuals at once
-                    scores = attack.calculate_confidence_batch(population)
-                    scores = np.nan_to_num(scores, nan=1.0)
+        results    = {}
+        saved_rate = self.mutation_rate
+        self.mutation_rate = mutation_rate
 
-                    success_idx = np.where(scores < 0.5)[0]
-                    if len(success_idx) > 0:
-                        success_generation = generation + 1
-                        break
+        try:
+            for threshold in thresholds:
+                print(f"\n--- Testing dummy row threshold: {threshold} ---")
 
-                    inv_scores = 1.0 - scores
+                suitable_frames = self._suitable_attack_frames(threshold)
+                print(f"Found {len(suitable_frames)} frames with dummy rows >= {threshold}")
 
-                    total = inv_scores.sum()
-                    num_positive = np.count_nonzero(inv_scores)
+                if len(suitable_frames) == 0:
+                    results[threshold] = 0
+                    print(f"Dummy row threshold {threshold}: No suitable frames found")
+                    continue
 
-                    if total <= 1e-12 or num_positive < 2:
-                        selection_probs = np.ones_like(inv_scores) / len(inv_scores)
-                    else:
-                        selection_probs = inv_scores / total
+                suitable_frames = suitable_frames[:max_frames]
 
-                    indices = np.arange(len(population))
-                    new_pop = []
+                generations_list = []
+                for idx, frame_idx in enumerate(suitable_frames):
+                    print(f"Processing frame {idx+1}/{len(suitable_frames)}")
+                    _, generations, _, _ = self._evolve(
+                        self.x_test[frame_idx], self.find_dummy_rows(frame_idx)
+                    )
+                    generations_list.append(generations)
 
-                    new_pop.append(population[np.argmin(scores)])
+                results[threshold] = float(np.mean(generations_list))
+                print(f"Dummy row threshold {threshold}: "
+                      f"Average generations = {results[threshold]:.2f}")
+        finally:
+            self.mutation_rate = saved_rate
 
-                    while len(new_pop) < attack.population_size:
-                        p1_idx, p2_idx = np.random.choice(indices, size=2, p=selection_probs, replace=False)
-                        child = attack.crossover(population[p1_idx], population[p2_idx])
-                        child = attack.mutate(child)
-                        new_pop.append(child)
-
-                    population = new_pop
-                
-                if success_generation == -1:
-                    success_generation = attack.max_generations
-                
-                generations_list.append(success_generation)
-            
-            if generations_list:
-                avg_generations = np.mean(generations_list)
-                results[threshold] = avg_generations
-                print(f"Dummy row threshold {threshold}: Average generations = {avg_generations:.2f}")
-            else:
-                results[threshold] = 0
-                print(f"Dummy row threshold {threshold}: No successful attacks")
-        
         return results
 
-    def plot_dummy_row_results(self,results):
+    def run_mutation_rate_experiment(self, max_frames=20, dummy_row_threshold=1,
+                                     mutation_rates=(0.1, 0.2, 0.3, 0.4, 0.5)):
+        """
+        Test the effect of the mutation rate on attack success.
+
+        Holds the frame set fixed and sweeps the mutation probability, so the
+        resulting curve isolates mutation pressure from frame difficulty.
+
+        Args:
+            max_frames: Number of frames to test per mutation rate
+            dummy_row_threshold: Minimum ECU-controlled rows a frame must have
+            mutation_rates: Mutation rates to sweep
+
+        Returns:
+            Dictionary mapping mutation rate to average generations needed
+        """
+        suitable_frames = self._suitable_attack_frames(dummy_row_threshold)[:max_frames]
+        print(f"Found {len(suitable_frames)} attack frames with dummy rows "
+              f">= {dummy_row_threshold}")
+
+        if len(suitable_frames) == 0:
+            print("No suitable frames found — skipping mutation rate experiment")
+            return {}
+
+        results    = {}
+        saved_rate = self.mutation_rate
+
+        try:
+            for rate in mutation_rates:
+                print(f"\n--- Testing mutation rate: {rate} ---")
+                self.mutation_rate = rate
+
+                generations_list = []
+                for idx, frame_idx in enumerate(suitable_frames):
+                    print(f"Processing frame {idx+1}/{len(suitable_frames)}")
+                    _, generations, _, _ = self._evolve(
+                        self.x_test[frame_idx], self.find_dummy_rows(frame_idx)
+                    )
+                    generations_list.append(generations)
+
+                results[rate] = float(np.mean(generations_list))
+                print(f"Mutation rate {rate}: Average generations = {results[rate]:.2f}")
+        finally:
+            self.mutation_rate = saved_rate
+
+        return results
+
+    def plot_dummy_row_results(self, results, filename='spoofing_dummy_rows_vs_generations.png'):
         """
         Create line plot showing the relationship between ECU-controlled dummy row threshold and attack performance.
-        
+
         Shows how the amount of ECU-controlled modification space affects attack difficulty.
-        
+
         Args:
             results: Dictionary mapping dummy row thresholds to average generations needed
+            filename: Output path for the PNG
         """
-        thresholds = list(results.keys())
+        thresholds = sorted(results)
         avgs = [results[t] for t in thresholds]
-        
+
         plt.figure(figsize=(10, 6))
         plt.plot(thresholds, avgs, 'o-', linewidth=2, markersize=8)
         plt.xlabel('Dummy Row Threshold')
@@ -412,10 +476,10 @@ class AdversarialSpoofAttack(GeneticAttack):
         plt.title('Effect of Dummy Row Threshold on Spoofing Adversarial Attack Generations')
         plt.grid(True)
         plt.ylim(bottom=0)
-        plt.savefig('spoofing_dummy_rows_vs_generations.png')
+        plt.savefig(filename)
         plt.close()
-        
-        print("Dummy row experiment plot saved as 'spoofing_dummy_rows_vs_generations.png'")
+
+        print(f"Dummy row experiment plot saved as '{filename}'")
 
     def apply(self, cfg):
         """
@@ -433,59 +497,77 @@ class AdversarialSpoofAttack(GeneticAttack):
         dir_path     = cfg['dir_path']
         dataset_name = cfg['dataset_name']
 
-        model_path  = "RPM_final_model.h5"
-        attack_file = os.path.join(dir_path, "..", "datasets", dataset_name, "adversarial_spoofing_attack.npz")
+        max_frames          = int(cfg.get('max_frames', 100))
+        dummy_row_threshold = int(cfg.get('dummy_row_threshold', 1))
+
+        # Scoped to the input file AND frame count: a single fixed filename would
+        # silently serve a cached result generated from a different dataset or a
+        # different max_frames.
+        attack_file = os.path.join(
+            dir_path, "..", "datasets", dataset_name,
+            f"adversarial_spoofing_attack_{cfg['file_name'][:-4]}_n{max_frames}.npz"
+        )
         timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_dir = os.path.join(dir_path, "..", "datasets", dataset_name, "Results", "attack_results", f"Spoof_{timestamp}")
         os.makedirs(results_dir, exist_ok=True)
 
-        attack = AdversarialSpoofAttack(
-            model_path=model_path,
-            population_size=100,    # Population size for genetic algorithm
-            max_generations=75,     # Maximum evolution generations
-            mutation_rate=0.2       # Mutation probability per individual
-        )
+        # This method runs on an instance the handler already built with the
+        # configured model, dataset and GA hyper-parameters — reuse it rather than
+        # constructing a second attack against a different model.
+        final_test = y_test = x_test = frame_indices = None
 
         if os.path.exists(attack_file):
             print("Adversarial attack already exists. Loading from file...")
             try:
-                data = np.load(attack_file)
-                final_test = data['final_test']  # Adversarial/benign frames
-                y_test = data['y_test']          # True labels
-                x_test = data['x_test']          # Original frames
+                data          = np.load(attack_file)
+                final_test    = data['final_test']  # Adversarial/benign frames
+                y_test        = data['y_test']      # True labels
+                x_test        = data['x_test']      # Original frames
+                frame_indices = data['frame_indices'] if 'frame_indices' in data else None
             except Exception as e:
-                print(f"Error loading file: {e}")
-                final_test, y_test, x_test, _ = attack.generate_adversarial_attack(dummy_row_threshold=1, max_frames=100)
-                try:
-                    np.savez(attack_file,
-                            final_test=final_test,
-                            y_test=y_test,
-                            x_test=x_test)
-                    print(f"Adversarial attack generated and saved to {attack_file}")
-                except Exception as e:
-                    print(f"Error saving file: {e}")
-        else:
-            try:
-                print("Generating new adversarial spoofing attack dataset...")
-                final_test, y_test, x_test, _ = attack.generate_adversarial_attack(dummy_row_threshold=1, max_frames=100)
+                print(f"Error loading {attack_file}: {e} — regenerating.")
+                final_test = None
 
-                np.savez(attack_file,
-                        final_test=final_test,
-                        y_test=y_test,
-                        x_test=x_test)
-                print(f"Adversarial attack generated and saved to {attack_file}")
-            except Exception as e:
-                print(f"Error during attack generation or saving: {e}")
+        if final_test is None:
+            print(f"Generating new adversarial spoofing attack dataset "
+                  f"(max_frames={max_frames}, dummy_row_threshold={dummy_row_threshold})...")
+            final_test, y_test, x_test, _, frame_indices = self.generate_adversarial_attack(
+                dummy_row_threshold=dummy_row_threshold, max_frames=max_frames
+            )
+            np.savez(attack_file,
+                     final_test=final_test,
+                     y_test=y_test,
+                     x_test=x_test,
+                     frame_indices=frame_indices)
+            print(f"Adversarial attack generated and saved to {attack_file}")
+
+        if cfg.get('write_perturbed_csv', True):
+            self.write_perturbed_traffic(cfg, final_test, y_test, frame_indices,
+                                        results_dir, label='spoof')
 
         print("Evaluating model performance on adversarial spoofing attack dataset...")
-        test_loss, test_accuracy = attack.model.evaluate(final_test, y_test, verbose=1)
+        # ── ORIGINAL ─────────────────────────────────────────────────────────
+        # # verbose=0: the Keras progress bar writes ANSI escapes and \r, which turn a
+        # # redirected log into unreadable single-line noise.
+        # test_loss, test_accuracy = self.model.evaluate(final_test, y_test, verbose=0)
+        # ─────────────────────────────────────────────────────────────────────
+        # CHANGED: GeneticAttack.evaluate wraps both frameworks — it forwards to
+        # Model.evaluate(verbose=0) for .h5 targets (same call, same silence) and
+        # computes sparse categorical cross-entropy + accuracy for .pth ones.
+        test_loss, test_accuracy = self.evaluate(final_test, y_test)
+        print(f"  Test loss {test_loss:.4f}, accuracy {test_accuracy:.4f}")
 
         with open(os.path.join(results_dir, "adversarial_spoof_test.txt"), "w") as f:
             f.write(f"Test Loss: {test_loss:.4f}\nTest Accuracy: {test_accuracy:.4f}\n")
 
         print("Computing detailed performance metrics...")
 
-        y_pred_prob = attack.model.predict(final_test)
+        # ── ORIGINAL ─────────────────────────────────────────────────────────
+        # y_pred_prob = self.model.predict(final_test, verbose=0)
+        # ─────────────────────────────────────────────────────────────────────
+        # CHANGED: framework-agnostic scoring. For a .pth target this also
+        # applies the softmax the bare nn.Linear head does not.
+        y_pred_prob = self.predict_proba(final_test)
         y_pred = np.argmax(y_pred_prob, axis=1)  # Convert probabilities to class predictions
 
         from sklearn.metrics import confusion_matrix, classification_report
@@ -499,8 +581,10 @@ class AdversarialSpoofAttack(GeneticAttack):
         recall = round(TP / (TP + FN), 4) if (TP + FN) > 0 else 0.0     # Recall (Sensitivity)
         f1 = round((2 * precision * recall) / (precision + recall), 4) if (precision + recall) > 0 else 0.0  # F1 Score
 
-        GeneticAttack.plot_confusion_matrix(cm, classes=['Normal', 'Attack'], suffix="adv_spoof_attack", normalize=True,
-                            title='Normalized Confusion Matrix',
+        # Raw counts, not normalized fractions, so the figure reads the same as the
+        # matrix written into evaluation_metrics_spoof_adv.txt.
+        self.plot_confusion_matrix(cm, classes=['Normal', 'Attack'], suffix="adv_spoof_attack", normalize=False,
+                            title='Confusion Matrix',
                             filename=os.path.join(results_dir, "confusion_matrix_adv_spoof_attack.png"))
 
         report = classification_report(y_test, y_pred, target_names=['Normal', 'Attack'])
@@ -542,11 +626,25 @@ class AdversarialSpoofAttack(GeneticAttack):
                 print(f"Attack comparison saved as spoof_attack_comparison_{cnt}.png")
                 cnt += 1
         
+        # Both sweeps re-run the full GA per frame per setting, so they cost far
+        # more than the attack itself — opt in via GeneticAdvAttack.run_experiments.
+        if not cfg.get('run_experiments', False):
+            print("\nSkipping parameter experiments "
+                  "(set GeneticAdvAttack.run_experiments: true to enable).")
+            return
+
         print("\n===== RUNNING MUTATION RATE EXPERIMENT =====")
-        mutation_results = GeneticAttack.run_mutation_rate_experiment(model_path, max_frames=20)
-        GeneticAttack.plot_mutation_rate_results(mutation_results)
-        
+        mutation_results = self.run_mutation_rate_experiment(max_frames=20)
+        if mutation_results:
+            self.plot_mutation_rate_results(
+                mutation_results,
+                filename=os.path.join(results_dir, "spoofing_mutation_rate_vs_generations.png"),
+            )
+
         print("\n===== RUNNING DUMMY ROW THRESHOLD EXPERIMENT =====")
-        dummy_row_results = self.run_dummy_row_experiment(model_path, max_frames=20)
-        plot_dummy_row_results(dummy_row_results)
+        dummy_row_results = self.run_dummy_row_experiment(max_frames=20)
+        self.plot_dummy_row_results(
+            dummy_row_results,
+            filename=os.path.join(results_dir, "spoofing_dummy_rows_vs_generations.png"),
+        )
 
