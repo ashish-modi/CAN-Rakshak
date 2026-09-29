@@ -30,9 +30,11 @@ class ThreeWay(BaseSplitter):
         sorted_images = sorted(images, key=self.extract_number)
 
         total  = len(sorted_images)
-        split1 = total // 3
-        split2 = 2 * total // 3
-
+        # split1 = total // 3
+        # split2 = 2 * total // 3
+        split1 = int(total * 0.5)
+        split2 = int(total)
+        
         part1_images = sorted_images[:split1]
         part2_images = sorted_images[split1:split2]
         part3_images = sorted_images[split2:]
@@ -80,8 +82,8 @@ class ThreeWay(BaseSplitter):
         os.makedirs(ip_dir, exist_ok=True)
 
         part_dirs = [
-            os.path.join(ip_dir, "surrogate_images"),
             os.path.join(ip_dir, "target_images"),
+            os.path.join(ip_dir, "surrogate_images"),
             os.path.join(ip_dir, "test_images"),
         ]
         input_directory = os.path.join(self.input_dir, "features", "Images", file_name[:-4] + "_images")
@@ -89,7 +91,8 @@ class ThreeWay(BaseSplitter):
         part1_imgs, part2_imgs, part3_imgs = self.sequential_split_images_three(input_directory, part_dirs)
 
         # PixNet label/track splitting — work in progress, will be released upon publication
-        if self.feature_extractor == "PixNet":
+        extractor_name = self.cfg.get('feature_extractor', '')
+        if extractor_name.lower() == "pixnet":
             label_file = os.path.join(input_directory, "labels.txt")
             self.split_labels_three(
                 label_file,

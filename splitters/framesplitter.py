@@ -19,7 +19,7 @@ class FrameSplitter(BaseSplitter):
         features_path = self.feature_extractor.features_path
         frames_csv    = os.path.join(features_path, "Frames", prefix + "_frames.csv")
         labels_csv    = os.path.join(features_path, "Frames", prefix + "_labels.csv")
-
+        print("Inside frame splitter")
         if not (os.path.exists(frames_csv) and os.path.exists(labels_csv)):
             print(f"  No frame features found at {os.path.dirname(frames_csv)}, skipping split.")
             return
@@ -39,19 +39,25 @@ class FrameSplitter(BaseSplitter):
         os.makedirs(train_dir, exist_ok=True)
         os.makedirs(test_dir,  exist_ok=True)
 
-        self.save_frames_and_labels(
-            x_train, y_train,
-            os.path.join(train_dir, prefix + "_train_frames.csv"),
-            os.path.join(train_dir, prefix + "_train_labels.csv")
-        )
-        self.save_frames_and_labels(
-            x_test, y_test,
-            os.path.join(test_dir, prefix + "_test_frames.csv"),
-            os.path.join(test_dir, prefix + "_test_labels.csv")
-        )
+        train_frames_csv = os.path.join(train_dir, prefix + "_train_frames.csv")
+        test_frames_csv  = os.path.join(test_dir,  prefix + "_test_frames.csv")
 
-        np.savez(os.path.join(train_dir, prefix + "_train_data.npz"), x_train=x_train, y_train=y_train)
-        np.savez(os.path.join(test_dir,  prefix + "_test_data.npz"),  x_test=x_test,  y_test=y_test)
+        if not os.path.exists(train_frames_csv):
+            print("Creating trian frames")
+            self.save_frames_and_labels(
+                x_train, y_train,
+                os.path.join(train_dir, prefix + "_train_frames.csv"),
+                os.path.join(train_dir, prefix + "_train_labels.csv")
+            )
+
+        if not os.path.exists(test_frames_csv):
+            print("Creating test frames")
+            self.save_frames_and_labels(
+                x_test, y_test,
+                os.path.join(test_dir, prefix + "_test_frames.csv"),
+                os.path.join(test_dir, prefix + "_test_labels.csv")
+            )
+
         print(f"  Split          : Train={len(y_train)}, Test={len(y_test)}")
 
     def load_frames_and_labels(self, frames_csv, labels_csv):

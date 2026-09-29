@@ -50,8 +50,20 @@ def sequential_split_images(src_folder, train_folder, test_folder, split_ratio=0
     for img in test_images:
         shutil.copy(os.path.join(src_folder, img), os.path.join(test_folder, img))
 
+    return train_images, test_images
+
 
 def split_labels(label_file, train_images, test_images, train_label_file, test_label_file):
+    """Write each side's labels from `label_file`, the source of THIS call.
+
+    A side with no images is skipped rather than written empty. run_all_ids.py
+    expresses a two-file request as two passes over this function with
+    split_ratio pinned to 0.0 (whole file -> train) and then 1.0 (whole file ->
+    test). The second pass has no train images and must leave the train label
+    file the first pass wrote alone; truncating it there is what silently
+    replaced the train labels with the test file's, mislabelling 52% of the
+    training set.
+    """
     labels = {}
     with open(label_file, "r") as f:
         for line in f:
@@ -59,15 +71,20 @@ def split_labels(label_file, train_images, test_images, train_label_file, test_l
                 img, lab = line.strip().split(":", 1)
                 labels[img.strip()] = lab.strip()
 
-    with open(train_label_file, "w") as f:
-        for img in train_images:
-            if img in labels:
-                f.write(f"{img}: {labels[img]}\n")
-
-    with open(test_label_file, "w") as f:
-        for img in test_images:
-            if img in labels:
-                f.write(f"{img}: {labels[img]}\n")
+    for images, out_path in ((train_images, train_label_file),
+                             (test_images, test_label_file)):
+        if not images:
+            continue
+        written = 0
+        with open(out_path, "w") as f:
+            for img in images:
+                if img in labels:
+                    f.write(f"{img}: {labels[img]}\n")
+                    written += 1
+        missing = len(images) - written
+        print(f"  labels -> {os.path.basename(os.path.dirname(out_path))}/"
+              f"{os.path.basename(out_path)}: {written} written"
+              + (f", {missing} image(s) had no label in the source" if missing else ""))
 
 
 def split_track_csv(track_csv, train_images, test_images, train_csv, test_csv):
@@ -80,10 +97,15 @@ def split_track_csv(track_csv, train_images, test_images, train_csv, test_csv):
     train_df = df[df["image_no"].isin(train_img_nums)]
     test_df  = df[df["image_no"].isin(test_img_nums)]
 
-    train_df.to_csv(train_csv, index=False)
-    test_df.to_csv(test_csv, index=False)
+    # Same guard as split_labels: a side this call contributed no images to
+    # keeps whatever the other pass wrote, rather than being truncated.
+    if train_images:
+        train_df.to_csv(train_csv, index=False)
+    if test_images:
+        test_df.to_csv(test_csv, index=False)
 
-    print(f"Track split → Train rows: {len(train_df)}, Test rows: {len(test_df)}")
+    print(f"Track split → Train rows: {len(train_df) if train_images else 'kept'}, "
+          f"Test rows: {len(test_df) if test_images else 'kept'}")
 
 
 def split_and_store_data(cfg):
@@ -100,13 +122,12 @@ def split_and_store_data(cfg):
     input_directory = os.path.join(input_dir, "features", "Images", file_name[:-4] + "_images")
 
     print("Splitting dataset into Train and Test")
-    sequential_split_images(input_directory, train_dir, test_dir, cfg['split_ratio'])
+    train_images, test_images = sequential_split_images(
+        input_directory, train_dir, test_dir, cfg['split_ratio'])
 
     # PixNet label/track splitting — work in progress, will be released upon publication
     if cfg['feature_extractor'] == "PixNet":
         label_file       = os.path.join(input_directory, "labels.txt")
-        train_images     = sorted(extract_files(train_dir), key=extract_number)
-        test_images      = sorted(extract_files(test_dir),  key=extract_number)
         train_label_file = os.path.join(train_dir, "labels.txt")
         test_label_file  = os.path.join(test_dir,  "labels.txt")
         split_labels(label_file, train_images, test_images, train_label_file, test_label_file)
